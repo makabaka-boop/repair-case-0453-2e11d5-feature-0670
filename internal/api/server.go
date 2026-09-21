@@ -18,6 +18,9 @@ const (
 	MaxPayloadBytes   = 65536
 	// Generous envelope ceiling: payload plus JSON framing.
 	MaxChunkBodyBytes = MaxPayloadBytes + 4096
+	// WriteTokenHeader carries the write token for protected batches:
+	// chunk submit, seal and write-token rotation.
+	WriteTokenHeader = "X-Batch-Write-Token"
 )
 
 // Server wires the store to HTTP routes.
@@ -43,6 +46,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/batches/{id}", s.handleGetBatch)
 	s.mux.HandleFunc("POST /api/v1/batches/{id}/chunks", s.handleSubmitChunk)
 	s.mux.HandleFunc("POST /api/v1/batches/{id}/seal", s.handleSeal)
+	s.mux.HandleFunc("POST /api/v1/batches/{id}/write-token/rotate", s.handleRotateWriteToken)
 }
 
 // Handler returns the root handler with request logging.
@@ -55,7 +59,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 type createBatchRequest struct {
-	ExpectedChunks int `json:"expectedChunks"`
+	ExpectedChunks int  `json:"expectedChunks"`
+	ProtectWrites  bool `json:"protectWrites"`
 }
 
 func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +73,7 @@ func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			"expectedChunks must be an integer between 1 and 10000")
 		return
 	}
-	b, err := s.store.CreateBatch(r.Context(), req.ExpectedChunks)
+	b, err := s.store.CreateBatch(r.Context(), req.ExpectedChunks, req.ProtectWrites)
 	if err != nil {
 		s.log.Printf("create batch: %v", err)
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
@@ -122,16 +127,19 @@ func (s *Server) handleSubmitChunk(w http.ResponseWriter, r *http.Request) {
 			"payload must be at most 65536 UTF-8 bytes")
 		return
 	}
-	if seq < 1 {
-		writeError(w, http.StatusBadRequest, "INVALID_SEQ",
-			"seq must be between 1 and expectedChunks")
-		return
-	}
+	// seq range (including seq < 1) is decided inside the locked store
+	// transaction after the token check; the API only rejects values the
+	// JSON/type layer could not represent as a valid integer.
 
-	result, err := s.store.SubmitChunk(r.Context(), batchID, seq, payloadBytes)
+	result, err := s.store.SubmitChunk(r.Context(), batchID, seq, payloadBytes, r.Header.Get(WriteTokenHeader))
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "BATCH_NOT_FOUND", "batch does not exist")
+	case errors.Is(err, store.ErrWriteCapabilityRequired):
+		writeWriteCapabilityRequired(w)
+	case errors.Is(err, store.ErrInvalidSeq):
+		writeError(w, http.StatusBadRequest, "INVALID_SEQ",
+			"seq must be between 1 and expectedChunks")
 	case errors.Is(err, store.ErrSeqRange):
 		writeError(w, http.StatusBadRequest, "SEQ_OUT_OF_RANGE",
 			"seq must be between 1 and expectedChunks")
@@ -182,10 +190,12 @@ func (s *Server) handleSeal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	snap, err := s.store.SealBatch(r.Context(), batchID)
+	snap, err := s.store.SealBatch(r.Context(), batchID, r.Header.Get(WriteTokenHeader))
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "BATCH_NOT_FOUND", "batch does not exist")
+	case errors.Is(err, store.ErrWriteCapabilityRequired):
+		writeWriteCapabilityRequired(w)
 	case errors.Is(err, store.ErrIncomplete):
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error":    "INCOMPLETE",
@@ -202,6 +212,31 @@ func (s *Server) handleSeal(w http.ResponseWriter, r *http.Request) {
 	default:
 		// Repeated seal of an already SEALED batch is idempotent.
 		writeJSON(w, http.StatusOK, snapshotJSON(snap))
+	}
+}
+
+func (s *Server) handleRotateWriteToken(w http.ResponseWriter, r *http.Request) {
+	batchID, ok := batchIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	newToken, err := s.store.RotateWriteToken(r.Context(), batchID, r.Header.Get(WriteTokenHeader))
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "BATCH_NOT_FOUND", "batch does not exist")
+	case errors.Is(err, store.ErrNotProtected):
+		writeError(w, http.StatusConflict, "BATCH_NOT_PROTECTED",
+			"batch was not created with protectWrites")
+	case errors.Is(err, store.ErrWriteCapabilityRequired):
+		writeWriteCapabilityRequired(w)
+	case err != nil:
+		s.log.Printf("rotate write token: %v", err)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"batchId":    batchID,
+			"writeToken": newToken,
+		})
 	}
 }
 
@@ -235,7 +270,20 @@ func batchJSON(b *store.Batch) map[string]any {
 		"status":         b.Status,
 		"createdAt":      b.CreatedAt.UTC().Format(time.RFC3339Nano),
 	}
+	// The raw token is emitted only by the single response that issues it
+	// (protected create, successful rotation); it is never read back.
+	if b.WriteToken != "" {
+		resp["writeToken"] = b.WriteToken
+	}
 	return resp
+}
+
+// writeWriteCapabilityRequired answers every failed token verdict with one
+// identical 403 so callers cannot distinguish "missing" from "wrong", nor
+// open / incomplete / sealed batch states, without a valid token.
+func writeWriteCapabilityRequired(w http.ResponseWriter) {
+	writeError(w, http.StatusForbidden, "WRITE_CAPABILITY_REQUIRED",
+		"a valid X-Batch-Write-Token is required for this protected batch")
 }
 
 func snapshotJSON(s *store.Snapshot) map[string]any {

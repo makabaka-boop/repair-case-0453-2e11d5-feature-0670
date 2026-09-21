@@ -98,7 +98,7 @@ func containsQ(u string) bool {
 
 func mustBatch(ctx context.Context, t *testing.T, s *store.Store, expected int) *store.Batch {
 	t.Helper()
-	b, err := s.CreateBatch(ctx, expected)
+	b, err := s.CreateBatch(ctx, expected, false)
 	if err != nil {
 		t.Fatalf("create batch: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestConcurrentFirstBootMigrate(t *testing.T) {
 				return
 			}
 			// Prove the migrated schema is usable, then release.
-			_, err = st.CreateBatch(ctx, 1)
+			_, err = st.CreateBatch(ctx, 1, false)
 			if err != nil {
 				errs[i] = err
 			}
@@ -160,7 +160,7 @@ func TestCreateBatchValidatesRange(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newStore(ctx, t)
 	for _, n := range []int{0, -1, 10001} {
-		if _, err := s.CreateBatch(ctx, n); err == nil {
+		if _, err := s.CreateBatch(ctx, n, false); err == nil {
 			t.Fatalf("expected error for expectedChunks=%d", n)
 		}
 	}
@@ -172,7 +172,7 @@ func TestOutOfOrderThenSnapshot(t *testing.T) {
 	b := mustBatch(ctx, t, s, 4)
 
 	for _, seq := range []int{4, 2, 1} {
-		res, err := s.SubmitChunk(ctx, b.ID, seq, []byte{byte('a' + seq)})
+		res, err := s.SubmitChunk(ctx, b.ID, seq, []byte{byte('a' + seq)}, "")
 		if err != nil {
 			t.Fatalf("submit %d: %v", seq, err)
 		}
@@ -195,11 +195,11 @@ func TestRetransmissionIsIdempotent(t *testing.T) {
 	s, _ := newStore(ctx, t)
 	b := mustBatch(ctx, t, s, 2)
 
-	first, err := s.SubmitChunk(ctx, b.ID, 1, []byte("hello"))
+	first, err := s.SubmitChunk(ctx, b.ID, 1, []byte("hello"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.SubmitChunk(ctx, b.ID, 1, []byte("hello"))
+	second, err := s.SubmitChunk(ctx, b.ID, 1, []byte("hello"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestRetransmissionIsIdempotent(t *testing.T) {
 	}
 
 	// Same seq, different bytes -> conflict.
-	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("hellX")); !errors.Is(err, store.ErrConflict) {
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("hellX"), ""); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("want ErrConflict, got %v", err)
 	}
 }
@@ -223,14 +223,14 @@ func TestUTF8ByteIdentity(t *testing.T) {
 
 	// "é" as UTF-8 (0xC3 0xA9) versus Latin-1 (0xE9): same letter, different
 	// bytes, so the retransmission must be a conflict.
-	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("caf\xc3\xa9")); err != nil {
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("caf\xc3\xa9"), ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("caf\xe9")); !errors.Is(err, store.ErrConflict) {
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("caf\xe9"), ""); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("different UTF-8 bytes should conflict, got %v", err)
 	}
 	// Identical bytes are the original acknowledgement.
-	res, err := s.SubmitChunk(ctx, b.ID, 1, []byte("caf\xc3\xa9"))
+	res, err := s.SubmitChunk(ctx, b.ID, 1, []byte("caf\xc3\xa9"), "")
 	if err != nil || res.Created {
 		t.Fatalf("identical retransmission wrong: res=%+v err=%v", res, err)
 	}
@@ -241,8 +241,13 @@ func TestSeqRangeRejected(t *testing.T) {
 	s, _ := newStore(ctx, t)
 	b := mustBatch(ctx, t, s, 2)
 
-	for _, seq := range []int{0, -1, 3, 10000} {
-		if _, err := s.SubmitChunk(ctx, b.ID, seq, []byte("x")); !errors.Is(err, store.ErrSeqRange) {
+	for _, seq := range []int{0, -1} {
+		if _, err := s.SubmitChunk(ctx, b.ID, seq, []byte("x"), ""); !errors.Is(err, store.ErrInvalidSeq) {
+			t.Fatalf("seq=%d: want ErrInvalidSeq, got %v", seq, err)
+		}
+	}
+	for _, seq := range []int{3, 10000} {
+		if _, err := s.SubmitChunk(ctx, b.ID, seq, []byte("x"), ""); !errors.Is(err, store.ErrSeqRange) {
 			t.Fatalf("seq=%d: want ErrSeqRange, got %v", seq, err)
 		}
 	}
@@ -253,10 +258,10 @@ func TestSealIncompleteKeepsOpen(t *testing.T) {
 	s, _ := newStore(ctx, t)
 	b := mustBatch(ctx, t, s, 3)
 
-	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("a")); err != nil {
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("a"), ""); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := s.SealBatch(ctx, b.ID)
+	snap, err := s.SealBatch(ctx, b.ID, "")
 	if !errors.Is(err, store.ErrIncomplete) {
 		t.Fatalf("want ErrIncomplete, got %v", err)
 	}
@@ -281,13 +286,13 @@ func TestSealCompleteIsIdempotent(t *testing.T) {
 	s, _ := newStore(ctx, t)
 	b := mustBatch(ctx, t, s, 2)
 
-	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("a")); err != nil {
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("a"), ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SubmitChunk(ctx, b.ID, 2, []byte("b")); err != nil {
+	if _, err := s.SubmitChunk(ctx, b.ID, 2, []byte("b"), ""); err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := s.SealBatch(ctx, b.ID)
+	sealed, err := s.SealBatch(ctx, b.ID, "")
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
@@ -296,7 +301,7 @@ func TestSealCompleteIsIdempotent(t *testing.T) {
 	}
 
 	// Repeated seal returns the existing result with the same sealedAt.
-	again, err := s.SealBatch(ctx, b.ID)
+	again, err := s.SealBatch(ctx, b.ID, "")
 	if err != nil {
 		t.Fatalf("reseal: %v", err)
 	}
@@ -305,10 +310,10 @@ func TestSealCompleteIsIdempotent(t *testing.T) {
 	}
 
 	// Sealed batch rejects changed content, allows identical retransmission.
-	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("changed")); !errors.Is(err, store.ErrSealed) {
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("changed"), ""); !errors.Is(err, store.ErrSealed) {
 		t.Fatalf("want ErrSealed, got %v", err)
 	}
-	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("a")); err != nil {
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("a"), ""); err != nil {
 		t.Fatalf("identical retransmission after seal rejected: %v", err)
 	}
 }
@@ -319,7 +324,7 @@ func TestDuplicateChunksDoNotInflateCount(t *testing.T) {
 	b := mustBatch(ctx, t, s, 1)
 
 	for range 5 {
-		if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("x")); err != nil {
+		if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("x"), ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -352,12 +357,12 @@ func TestSealRacesFinalChunk(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, sealErr = s.SealBatch(ctx, b.ID)
+			_, sealErr = s.SealBatch(ctx, b.ID, "")
 		}()
 		go func() {
 			defer wg.Done()
 			<-start
-			_, _ = other.SubmitChunk(ctx, b.ID, 1, []byte("final"))
+			_, _ = other.SubmitChunk(ctx, b.ID, 1, []byte("final"), "")
 		}()
 		close(start)
 		wg.Wait()
@@ -379,7 +384,7 @@ func TestSealRacesFinalChunk(t *testing.T) {
 			}
 			// If the chunk did land, another seal must now succeed atomically.
 			if len(snap.Gaps) == 0 {
-				again, err := s.SealBatch(ctx, b.ID)
+				again, err := s.SealBatch(ctx, b.ID, "")
 				if err != nil || again.Status != store.StatusSealed {
 					t.Fatalf("follow-up seal failed: snap=%+v err=%v", again, err)
 				}
@@ -410,8 +415,8 @@ func TestConflictingConcurrentSubmits(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		var err1, err2 error
-		go func() { defer wg.Done(); _, err1 = s.SubmitChunk(ctx, b.ID, 1, []byte("AAAA")) }()
-		go func() { defer wg.Done(); _, err2 = other.SubmitChunk(ctx, b.ID, 1, []byte("BBBB")) }()
+		go func() { defer wg.Done(); _, err1 = s.SubmitChunk(ctx, b.ID, 1, []byte("AAAA"), "") }()
+		go func() { defer wg.Done(); _, err2 = other.SubmitChunk(ctx, b.ID, 1, []byte("BBBB"), "") }()
 		wg.Wait()
 
 		conflicts := 0
@@ -445,23 +450,23 @@ func TestRestartConsistency(t *testing.T) {
 	open := mustBatch(ctx, t, s, 3)
 	sealed := mustBatch(ctx, t, s, 2)
 
-	if _, err := s.SubmitChunk(ctx, open.ID, 1, []byte("o1")); err != nil {
+	if _, err := s.SubmitChunk(ctx, open.ID, 1, []byte("o1"), ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SubmitChunk(ctx, open.ID, 3, []byte("o3")); err != nil {
+	if _, err := s.SubmitChunk(ctx, open.ID, 3, []byte("o3"), ""); err != nil {
 		t.Fatal(err)
 	}
-	openAck, err := s.SubmitChunk(ctx, open.ID, 1, []byte("o1"))
+	openAck, err := s.SubmitChunk(ctx, open.ID, 1, []byte("o1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for seq, p := range map[int]string{1: "s1", 2: "s2"} {
-		if _, err := s.SubmitChunk(ctx, sealed.ID, seq, []byte(p)); err != nil {
+		if _, err := s.SubmitChunk(ctx, sealed.ID, seq, []byte(p), ""); err != nil {
 			t.Fatal(err)
 		}
 	}
-	sealedSnap, err := s.SealBatch(ctx, sealed.ID)
+	sealedSnap, err := s.SealBatch(ctx, sealed.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +489,7 @@ func TestRestartConsistency(t *testing.T) {
 
 	// The retransmission acknowledgement after restart must still be the
 	// original confirmation, not a new record.
-	ack2, err := restarted.SubmitChunk(ctx, open.ID, 1, []byte("o1"))
+	ack2, err := restarted.SubmitChunk(ctx, open.ID, 1, []byte("o1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +504,7 @@ func TestRestartConsistency(t *testing.T) {
 	if gotSealed.Status != store.StatusSealed || !gotSealed.SealedAt.Equal(*sealedSnap.SealedAt) {
 		t.Fatalf("sealed verdict changed after restart: %+v", gotSealed)
 	}
-	if _, err := restarted.SealBatch(ctx, sealed.ID); err != nil {
+	if _, err := restarted.SealBatch(ctx, sealed.ID, ""); err != nil {
 		t.Fatalf("repeated seal after restart should be idempotent: %v", err)
 	}
 }
@@ -602,7 +607,7 @@ func TestSubmitObservesChunkCommittedDuringLockWait(t *testing.T) {
 			}
 			done := make(chan outcome, 1)
 			go func() {
-				res, err := s.SubmitChunk(ctx, b.ID, 1, []byte(tc.payload))
+				res, err := s.SubmitChunk(ctx, b.ID, 1, []byte(tc.payload), "")
 				done <- outcome{res, err}
 			}()
 			// The submit's snapshot is fixed before the holder commits.
@@ -658,7 +663,7 @@ func TestSealObservesFinalChunkCommittedDuringLockWait(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		snap, err := s.SealBatch(ctx, b.ID)
+		snap, err := s.SealBatch(ctx, b.ID, "")
 		done <- outcome{snap, err}
 	}()
 	// The seal's snapshot is fixed before the holder commits.
