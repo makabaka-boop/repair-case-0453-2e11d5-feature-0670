@@ -10,7 +10,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	_ "embed"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -30,11 +33,13 @@ const (
 )
 
 var (
-	ErrNotFound   = errors.New("batch not found")
-	ErrConflict   = errors.New("chunk conflict")
-	ErrSealed     = errors.New("batch sealed")
-	ErrIncomplete = errors.New("batch incomplete")
-	ErrSeqRange   = errors.New("sequence out of range")
+	ErrNotFound        = errors.New("batch not found")
+	ErrConflict        = errors.New("chunk conflict")
+	ErrSealed          = errors.New("batch sealed")
+	ErrIncomplete      = errors.New("batch incomplete")
+	ErrSeqRange        = errors.New("sequence out of range")
+	ErrWriteCapability = errors.New("write capability required")
+	ErrNotProtected    = errors.New("batch not protected")
 )
 
 // Batch is the persisted batch header.
@@ -142,27 +147,65 @@ func NewBatchID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// NewWriteToken returns a 256-bit random token encoded as unpadded base64url
+// and the SHA-256 digest stored for later comparison.
+func NewWriteToken() (string, []byte, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", nil, err
+	}
+	token := base64.RawURLEncoding.EncodeToString(b[:])
+	digest := sha256.Sum256([]byte(token))
+	return token, digest[:], nil
+}
+
+func hashWriteToken(token string) []byte {
+	digest := sha256.Sum256([]byte(token))
+	return digest[:]
+}
+
 // CreateBatch inserts an OPEN batch. A random ID collision is retried.
 func (s *Store) CreateBatch(ctx context.Context, expectedChunks int) (*Batch, error) {
+	b, _, err := s.createBatch(ctx, expectedChunks, false)
+	return b, err
+}
+
+// CreateProtectedBatch inserts an OPEN batch requiring a write token and
+// returns the one-time plaintext token.
+func (s *Store) CreateProtectedBatch(ctx context.Context, expectedChunks int) (*Batch, string, error) {
+	return s.createBatch(ctx, expectedChunks, true)
+}
+
+func (s *Store) createBatch(ctx context.Context, expectedChunks int, protected bool) (*Batch, string, error) {
+	var token string
+	var digest []byte
+	if protected {
+		var err error
+		token, digest, err = NewWriteToken()
+		if err != nil {
+			return nil, "", err
+		}
+	}
+
 	const maxAttempts = 3
 	for range maxAttempts {
 		id := NewBatchID()
 		var b Batch
 		err := s.pool.QueryRow(ctx,
-			`INSERT INTO batches (id, expected_chunks) VALUES ($1, $2)
+			`INSERT INTO batches (id, expected_chunks, write_token_digest) VALUES ($1, $2, $3)
 			 RETURNING id, expected_chunks, status, created_at, sealed_at`,
-			id, expectedChunks,
+			id, expectedChunks, digest,
 		).Scan(&b.ID, &b.ExpectedChunks, &b.Status, &b.CreatedAt, &b.SealedAt)
 		if err == nil {
-			return &b, nil
+			return &b, token, nil
 		}
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
 			continue
 		}
-		return nil, err
+		return nil, "", err
 	}
-	return nil, errors.New("could not allocate unique batch id")
+	return nil, "", errors.New("could not allocate unique batch id")
 }
 
 // SubmitChunk stores a chunk. The batch row is locked for the duration of the
@@ -172,7 +215,11 @@ func (s *Store) CreateBatch(ctx context.Context, expectedChunks int) (*Batch, er
 //   - retransmission with identical UTF-8 bytes: result.Created == false, nil
 //   - same seq, different payload: zero result, ErrConflict
 //   - sealed batch, any non-identical write: zero result, ErrSealed
-func (s *Store) SubmitChunk(ctx context.Context, batchID string, seq int, payload []byte) (SubmitResult, error) {
+func (s *Store) SubmitChunk(ctx context.Context, batchID string, seq int, payload []byte, writeTokens ...string) (SubmitResult, error) {
+	var writeToken string
+	if len(writeTokens) > 0 {
+		writeToken = writeTokens[0]
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return SubmitResult{}, err
@@ -181,15 +228,19 @@ func (s *Store) SubmitChunk(ctx context.Context, batchID string, seq int, payloa
 
 	var expected int
 	var status string
+	var digest []byte
 	err = tx.QueryRow(ctx,
-		`SELECT expected_chunks, status FROM batches WHERE id = $1 FOR UPDATE`,
+		`SELECT expected_chunks, status, write_token_digest FROM batches WHERE id = $1 FOR UPDATE`,
 		batchID,
-	).Scan(&expected, &status)
+	).Scan(&expected, &status, &digest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SubmitResult{}, ErrNotFound
 	}
 	if err != nil {
 		return SubmitResult{}, err
+	}
+	if !writeTokenAuthorized(digest, writeToken) {
+		return SubmitResult{}, ErrWriteCapability
 	}
 	if seq < 1 || seq > expected {
 		return SubmitResult{}, ErrSeqRange
@@ -243,6 +294,16 @@ func (s *Store) SubmitChunk(ctx context.Context, batchID string, seq int, payloa
 	return SubmitResult{Created: true, Seq: seq, Size: len(payload), ReceivedAt: receivedAt}, nil
 }
 
+func writeTokenAuthorized(storedDigest []byte, writeToken string) bool {
+	if len(storedDigest) == 0 {
+		return true
+	}
+	presented := hashWriteToken(writeToken)
+	return subtle.ConstantTimeCompare(presented, storedDigest) == 1
+}
+
+func isProtected(digest []byte) bool { return len(digest) > 0 }
+
 // Snapshot returns a consistent status view of a batch.
 func (s *Store) Snapshot(ctx context.Context, batchID string) (*Snapshot, error) {
 	return snapshotQuery(ctx, s.pool, batchID, false)
@@ -256,12 +317,30 @@ func (s *Store) Snapshot(ctx context.Context, batchID string) (*Snapshot, error)
 // ErrIncomplete is returned together with the post-lock snapshot so the API
 // can report the ascending gap list. A repeated seal is idempotent and
 // returns the existing SEALED snapshot with nil.
-func (s *Store) SealBatch(ctx context.Context, batchID string) (*Snapshot, error) {
+func (s *Store) SealBatch(ctx context.Context, batchID string, writeTokens ...string) (*Snapshot, error) {
+	var writeToken string
+	if len(writeTokens) > 0 {
+		writeToken = writeTokens[0]
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+
+	var digest []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT write_token_digest FROM batches WHERE id = $1 FOR UPDATE`,
+		batchID,
+	).Scan(&digest); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if !writeTokenAuthorized(digest, writeToken) {
+		return nil, ErrWriteCapability
+	}
 
 	snap, err := snapshotQuery(ctx, tx, batchID, true)
 	if err != nil {
@@ -288,6 +367,51 @@ func (s *Store) SealBatch(ctx context.Context, batchID string) (*Snapshot, error
 	snap.Status = StatusSealed
 	snap.SealedAt = &sealedAt
 	return snap, nil
+}
+
+// RotateWriteToken atomically replaces a protected batch's write token. The
+// presented token is checked while the batch row lock is held, so an old token
+// presented by a request queued on a concurrent rotation is rejected after the
+// lock is released.
+func (s *Store) RotateWriteToken(ctx context.Context, batchID, writeToken string) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var digest []byte
+	err = tx.QueryRow(ctx,
+		`SELECT write_token_digest FROM batches WHERE id = $1 FOR UPDATE`,
+		batchID,
+	).Scan(&digest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if !isProtected(digest) {
+		return "", ErrNotProtected
+	}
+	if !writeTokenAuthorized(digest, writeToken) {
+		return "", ErrWriteCapability
+	}
+
+	newToken, newDigest, err := NewWriteToken()
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE batches SET write_token_digest = $1 WHERE id = $2`,
+		newDigest, batchID,
+	); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return newToken, nil
 }
 
 // querier is satisfied by both a pool and a transaction.

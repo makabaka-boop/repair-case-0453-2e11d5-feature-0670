@@ -7,8 +7,27 @@ CREATE TABLE IF NOT EXISTS batches (
     status           TEXT         NOT NULL DEFAULT 'OPEN'
                                    CHECK (status IN ('OPEN', 'SEALED')),
     created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    sealed_at        TIMESTAMPTZ
+    sealed_at        TIMESTAMPTZ,
+    write_token_digest BYTEA
 );
+
+ALTER TABLE batches
+    ADD COLUMN IF NOT EXISTS write_token_digest BYTEA;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint c
+          JOIN pg_namespace n ON n.oid = c.connamespace
+         WHERE c.conname = 'batches_write_token_digest_len'
+           AND n.nspname = current_schema()
+    ) THEN
+        ALTER TABLE batches
+            ADD CONSTRAINT batches_write_token_digest_len
+            CHECK (write_token_digest IS NULL OR octet_length(write_token_digest) = 32);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS chunks (
     batch_id    CHAR(32)     NOT NULL

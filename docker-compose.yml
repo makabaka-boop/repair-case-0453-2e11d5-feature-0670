@@ -62,6 +62,7 @@ services:
     environment:
       API1_URL: http://api1:8080
       API2_URL: http://api2:8080
+      DATABASE_URL: postgres://postgres:postgres@db:5432/batchseal?sslmode=disable
       VERIFY_PHASE: ${VERIFY_PHASE:-}
     depends_on:
       db:

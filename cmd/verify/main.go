@@ -18,14 +18,22 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const (
-	stateFile = "/verify-state/state.json"
-)
+const defaultStateFile = "/verify-state/state.json"
+
+func stateFilePath() string {
+	if path := os.Getenv("STATE_FILE"); path != "" {
+		return path
+	}
+	return defaultStateFile
+}
 
 type config struct {
 	api1 string
@@ -51,6 +59,8 @@ func main() {
 
 	v.checkLifecycleAcrossInstances(ctx)
 	v.checkValidation(ctx)
+	v.checkProtectedWrites(ctx)
+	v.checkProtectedRotationLockOrder(ctx)
 	v.checkCrossInstanceSealRace(ctx)
 
 	switch phase := os.Getenv("VERIFY_PHASE"); phase {
@@ -120,7 +130,7 @@ func (v *verifier) waitFor(ctx context.Context, url string) {
 	v.failf("timeout waiting for %s", url)
 }
 
-func (v *verifier) request(ctx context.Context, method, url string, body any) (int, map[string]any, []byte) {
+func (v *verifier) request(ctx context.Context, method, url string, body any, headers ...map[string]string) (int, map[string]any, []byte) {
 	var rdr io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -133,6 +143,11 @@ func (v *verifier) request(ctx context.Context, method, url string, body any) (i
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for _, h := range headers {
+		for key, value := range h {
+			req.Header.Set(key, value)
+		}
 	}
 	resp, err := v.client.Do(req)
 	if err != nil {
@@ -243,6 +258,261 @@ func (v *verifier) checkLifecycleAcrossInstances(ctx context.Context) {
 	submit(v.cfg.api2, 1, "changed", 409, nil)
 	// New seq also rejected.
 	submit(v.cfg.api1, 4, "four", 200, true) // identical
+}
+
+func (v *verifier) createProtectedBatch(ctx context.Context, base string, expected int) (string, string) {
+	code, body, _ := v.request(ctx, http.MethodPost, base+"/api/v1/batches",
+		map[string]any{"expectedChunks": expected, "protectWrites": true})
+	if code != 201 {
+		v.failf("create protected batch: status=%d body=%v", code, body)
+		return "", ""
+	}
+	id, _ := body["batchId"].(string)
+	token, _ := body["writeToken"].(string)
+	if len(id) != 32 || len(token) != 43 {
+		v.failf("protected create returned bad id/token: %v", body)
+	}
+	return id, token
+}
+
+func tokenHeader(token string) map[string]string {
+	return map[string]string{"X-Batch-Write-Token": token}
+}
+
+// checkProtectedWrites verifies creation, token-gated write/seal, old row
+// compatibility, rotation and identical 403 responses across batch states.
+func (v *verifier) checkProtectedWrites(ctx context.Context) {
+	id := v.createBatch(ctx, v.cfg.api1, 1)
+	code, body, _ := v.request(ctx, http.MethodPost,
+		v.cfg.api1+"/api/v1/batches/"+id+"/write-token/rotate", nil)
+	if code != 409 || body["error"] != "BATCH_NOT_PROTECTED" {
+		v.failf("legacy batch rotate: code=%d body=%v", code, body)
+	}
+	code, _, _ = v.request(ctx, http.MethodPost,
+		v.cfg.api1+"/api/v1/batches/"+id+"/chunks", map[string]any{"seq": 1, "payload": "legacy"})
+	if code != 201 {
+		v.failf("legacy batch write changed: %d", code)
+	}
+	code, _, _ = v.request(ctx, http.MethodPost, v.cfg.api1+"/api/v1/batches/"+id+"/seal", nil)
+	if code != 200 {
+		v.failf("legacy batch seal changed: %d", code)
+	}
+
+	pid, token := v.createProtectedBatch(ctx, v.cfg.api2, 2)
+	if pid == "" {
+		return
+	}
+	code, snap, _ := v.request(ctx, http.MethodGet, v.cfg.api1+"/api/v1/batches/"+pid, nil)
+	if code != 200 || snap["writeToken"] != nil {
+		v.failf("status must not expose writeToken: code=%d body=%v", code, snap)
+	}
+
+	expectForbidden := func(name, method, url string, requestBody any, headers ...map[string]string) {
+		code, body, _ := v.request(ctx, method, url, requestBody, headers...)
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			v.failf("%s: code=%d body=%v want 403 WRITE_CAPABILITY_REQUIRED", name, code, body)
+		}
+	}
+	openChunkURL := v.cfg.api1 + "/api/v1/batches/" + pid + "/chunks"
+	openSealURL := v.cfg.api2 + "/api/v1/batches/" + pid + "/seal"
+	rotateURL := v.cfg.api1 + "/api/v1/batches/" + pid + "/write-token/rotate"
+	for _, header := range []map[string]string{nil, tokenHeader("wrong")} {
+		// seq=0 would be INVALID_SEQ after authorization; it must instead be 403.
+		expectForbidden("open bad token chunk", http.MethodPost, openChunkURL,
+			map[string]any{"seq": 0, "payload": "blocked"}, header)
+		expectForbidden("open bad token seal", http.MethodPost, openSealURL, nil, header)
+		expectForbidden("open bad token rotate", http.MethodPost, rotateURL, nil, header)
+	}
+
+	code, _, _ = v.request(ctx, http.MethodPost, openChunkURL,
+		map[string]any{"seq": 1, "payload": "first"}, tokenHeader(token))
+	if code != 201 {
+		v.failf("authorized chunk: %d", code)
+	}
+	// Gap state: bad token must still produce the same 403, not chunk-specific
+	// conflict/validation or INCOMPLETE.
+	expectForbidden("gap bad token chunk", http.MethodPost, openChunkURL,
+		map[string]any{"seq": 2, "payload": "blocked"}, tokenHeader("wrong"))
+	expectForbidden("gap bad token seal", http.MethodPost, openSealURL, nil, tokenHeader("wrong"))
+
+	code, body, _ = v.request(ctx, http.MethodPost, rotateURL, nil, tokenHeader(token))
+	if code != 200 {
+		v.failf("rotation: code=%d body=%v", code, body)
+		return
+	}
+	newToken, _ := body["writeToken"].(string)
+	expectForbidden("old token chunk", http.MethodPost, openChunkURL,
+		map[string]any{"seq": 2, "payload": "old"}, tokenHeader(token))
+	code, _, _ = v.request(ctx, http.MethodPost, openChunkURL,
+		map[string]any{"seq": 2, "payload": "second"}, tokenHeader(newToken))
+	if code != 201 {
+		v.failf("rotated token chunk: %d", code)
+	}
+	code, body, _ = v.request(ctx, http.MethodPost, openSealURL, nil, tokenHeader(newToken))
+	if code != 200 || body["status"] != "SEALED" {
+		v.failf("rotated token seal: code=%d body=%v", code, body)
+	}
+	expectForbidden("sealed bad token chunk", http.MethodPost, openChunkURL,
+		map[string]any{"seq": 1, "payload": "changed"}, tokenHeader("wrong"))
+	expectForbidden("sealed bad token seal", http.MethodPost, openSealURL, nil, tokenHeader("wrong"))
+	expectForbidden("sealed bad token rotate", http.MethodPost, rotateURL, nil, tokenHeader("wrong"))
+	code, body, _ = v.request(ctx, http.MethodPost, rotateURL, nil, tokenHeader(newToken))
+	if code != 200 || body["writeToken"] == nil || body["writeToken"] == newToken {
+		v.failf("sealed rotation: code=%d body=%v", code, body)
+	}
+}
+
+func (v *verifier) verificationPool(ctx context.Context) *pgxpool.Pool {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		url = "postgres://postgres:postgres@db:5432/batchseal?sslmode=disable"
+	}
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		v.failf("connect verification database: %v", err)
+		return nil
+	}
+	if err := pool.Ping(ctx); err != nil {
+		v.failf("ping verification database: %v", err)
+		pool.Close()
+		return nil
+	}
+	return pool
+}
+
+func (v *verifier) holdBatchLock(ctx context.Context, pool *pgxpool.Pool, id string) func() {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		v.failf("begin lock holder: %v", err)
+		return func() {}
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT write_token_digest FROM batches WHERE id = $1 FOR UPDATE`, id); err != nil {
+		v.failf("hold batch lock: %v", err)
+		_ = tx.Rollback(ctx)
+		return func() {}
+	}
+	return func() { _ = tx.Commit(ctx) }
+}
+
+func (v *verifier) waitForBlocked(ctx context.Context, pool *pgxpool.Pool, want int) {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*)
+			 FROM pg_locks l
+			 JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE NOT l.granted
+			  AND (
+			        (l.locktype = 'tuple' AND l.relation = 'public.batches'::regclass)
+			     OR (l.locktype = 'transactionid'
+			         AND a.query LIKE '%FROM batches%FOR UPDATE%')
+			  )`).Scan(&n); err != nil {
+			v.failf("poll locks: %v", err)
+			return
+		}
+		if n >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	v.failf("did not observe %d blocked requests", want)
+}
+
+type verifyHTTPResult struct {
+	code int
+	body map[string]any
+}
+
+// checkProtectedRotationLockOrder deterministically forces both possible
+// queue orders over the two HTTP instances and the real database.
+func (v *verifier) checkProtectedRotationLockOrder(ctx context.Context) {
+	pool := v.verificationPool(ctx)
+	if pool == nil {
+		return
+	}
+	defer pool.Close()
+
+	id, oldToken := v.createProtectedBatch(ctx, v.cfg.api1, 1)
+	if id == "" {
+		return
+	}
+	chunksURL := v.cfg.api2 + "/api/v1/batches/" + id + "/chunks"
+	rotateURL := v.cfg.api1 + "/api/v1/batches/" + id + "/write-token/rotate"
+
+	// Rotation is first in the row-lock queue; old-token submit is second.
+	release := v.holdBatchLock(ctx, pool, id)
+	rotated := make(chan verifyHTTPResult, 1)
+	submitted := make(chan verifyHTTPResult, 1)
+	go func() {
+		code, body, _ := v.request(ctx, http.MethodPost, rotateURL, nil, tokenHeader(oldToken))
+		rotated <- verifyHTTPResult{code, body}
+	}()
+	v.waitForBlocked(ctx, pool, 1)
+	go func() {
+		code, body, _ := v.request(ctx, http.MethodPost, chunksURL,
+			map[string]any{"seq": 1, "payload": "old"}, tokenHeader(oldToken))
+		submitted <- verifyHTTPResult{code, body}
+	}()
+	v.waitForBlocked(ctx, pool, 2)
+	release()
+	rot := <-rotated
+	sub := <-submitted
+	if rot.code != 200 {
+		v.failf("queued-first rotation failed: code=%d body=%v", rot.code, rot.body)
+	}
+	if sub.code != 403 || sub.body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+		v.failf("queued-second old submit: code=%d body=%v", sub.code, sub.body)
+	}
+	_, snap, _ := v.request(ctx, http.MethodGet, v.cfg.api1+"/api/v1/batches/"+id, nil)
+	if int(snap["received"].(float64)) != 0 {
+		v.failf("rejected queued submit wrote data: %v", snap)
+	}
+	newToken, _ := rot.body["writeToken"].(string)
+	code, body, _ := v.request(ctx, http.MethodPost, chunksURL,
+		map[string]any{"seq": 1, "payload": "new"}, tokenHeader(newToken))
+	if code != 201 {
+		v.failf("new token after forced rotation: code=%d body=%v", code, body)
+	}
+
+	// Reverse order: old-token submit is first, succeeds; rotation then makes
+	// the old token invalid.
+	id2, oldToken2 := v.createProtectedBatch(ctx, v.cfg.api1, 1)
+	if id2 == "" {
+		return
+	}
+	release2 := v.holdBatchLock(ctx, pool, id2)
+	done := make(chan verifyHTTPResult, 1)
+	go func() {
+		code, body, _ := v.request(ctx, http.MethodPost,
+			v.cfg.api2+"/api/v1/batches/"+id2+"/chunks",
+			map[string]any{"seq": 1, "payload": "old"}, tokenHeader(oldToken2))
+		done <- verifyHTTPResult{code, body}
+	}()
+	v.waitForBlocked(ctx, pool, 1)
+	release2()
+	oldWrite := <-done
+	if oldWrite.code != 201 {
+		v.failf("queued-first old submit should succeed: code=%d body=%v", oldWrite.code, oldWrite.body)
+	}
+	code, body, _ = v.request(ctx, http.MethodPost,
+		v.cfg.api1+"/api/v1/batches/"+id2+"/write-token/rotate", nil, tokenHeader(oldToken2))
+	if code != 200 {
+		v.failf("rotation after first old submit: code=%d body=%v", code, body)
+	}
+	rotatedToken, _ := body["writeToken"].(string)
+	code, body, _ = v.request(ctx, http.MethodPost,
+		v.cfg.api2+"/api/v1/batches/"+id2+"/chunks",
+		map[string]any{"seq": 1, "payload": "old"}, tokenHeader(oldToken2))
+	if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+		v.failf("old token after reverse-order rotation: code=%d body=%v", code, body)
+	}
+	code, _, _ = v.request(ctx, http.MethodPost,
+		v.cfg.api1+"/api/v1/batches/"+id2+"/seal", nil, tokenHeader(rotatedToken))
+	if code != 200 {
+		v.failf("seal with reverse-order rotated token: %d", code)
+	}
 }
 
 // checkValidation covers the fixed status code matrix.
@@ -422,19 +692,19 @@ func (v *verifier) phaseRestart(ctx context.Context) {
 }
 
 func writeState(s persistedState) error {
-	if err := os.MkdirAll("/verify-state", 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(stateFilePath()), 0o755); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(stateFile, b, 0o644)
+	return os.WriteFile(stateFilePath(), b, 0o644)
 }
 
 func readState() (persistedState, error) {
 	var s persistedState
-	b, err := os.ReadFile(stateFile)
+	b, err := os.ReadFile(stateFilePath())
 	if err != nil {
 		return s, err
 	}

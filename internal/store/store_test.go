@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -103,6 +105,144 @@ func mustBatch(ctx context.Context, t *testing.T, s *store.Store, expected int) 
 		t.Fatalf("create batch: %v", err)
 	}
 	return b
+}
+
+func mustProtectedBatch(ctx context.Context, t *testing.T, s *store.Store, expected int) (*store.Batch, string) {
+	t.Helper()
+	b, token, err := s.CreateProtectedBatch(ctx, expected)
+	if err != nil {
+		t.Fatalf("create protected batch: %v", err)
+	}
+	if len(token) != 43 {
+		t.Fatalf("write token has wrong length: %q", token)
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(token); err != nil {
+		t.Fatalf("write token is not unpadded base64url: %v", err)
+	}
+	return b, token
+}
+
+func TestProtectedBatchStoresOnlyDigestAndEnforcesToken(t *testing.T) {
+	ctx := context.Background()
+	schema := newSchema(ctx, t)
+	s, err := store.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	raw := openRawPool(ctx, t, schema)
+
+	b, token := mustProtectedBatch(ctx, t, s, 2)
+	var digest []byte
+	if err := raw.QueryRow(ctx,
+		`SELECT write_token_digest FROM batches WHERE id = $1`, b.ID,
+	).Scan(&digest); err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := sha256.Sum256([]byte(token))
+	if len(digest) != 32 || !equalBytes(digest, wantDigest[:]) {
+		t.Fatalf("stored digest mismatch: len=%d", len(digest))
+	}
+	if string(digest) == token {
+		t.Fatal("plaintext write token was stored")
+	}
+
+	for _, supplied := range []string{"", "not-a-token", token + "x"} {
+		if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("x"), supplied); !errors.Is(err, store.ErrWriteCapability) {
+			t.Fatalf("submit with %q: want ErrWriteCapability, got %v", supplied, err)
+		}
+	}
+	if _, err := s.SubmitChunk(ctx, b.ID, 0, []byte("x"), ""); !errors.Is(err, store.ErrWriteCapability) {
+		t.Fatalf("invalid seq should be authenticated first: %v", err)
+	}
+	if _, err := s.SealBatch(ctx, b.ID); !errors.Is(err, store.ErrWriteCapability) {
+		t.Fatalf("seal without token: %v", err)
+	}
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("x"), token); err != nil {
+		t.Fatalf("valid submit: %v", err)
+	}
+
+	newToken, err := s.RotateWriteToken(ctx, b.ID, token)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if newToken == token {
+		t.Fatal("rotation returned the same token")
+	}
+	if _, err := s.SubmitChunk(ctx, b.ID, 2, []byte("y"), token); !errors.Is(err, store.ErrWriteCapability) {
+		t.Fatalf("old token still submits after rotation: %v", err)
+	}
+	if _, err := s.SubmitChunk(ctx, b.ID, 2, []byte("y"), newToken); err != nil {
+		t.Fatalf("new token submit: %v", err)
+	}
+	if _, err := s.SealBatch(ctx, b.ID, newToken); err != nil {
+		t.Fatalf("seal with new token: %v", err)
+	}
+}
+
+func TestOldRowsWithoutDigestRemainUnprotected(t *testing.T) {
+	ctx := context.Background()
+	schema := newSchema(ctx, t)
+	raw := openRawPool(ctx, t, schema)
+	if _, err := raw.Exec(ctx, `
+		CREATE TABLE batches (
+			id CHAR(32) PRIMARY KEY,
+			expected_chunks INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'OPEN',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			sealed_at TIMESTAMPTZ
+		)`); err != nil {
+		t.Fatalf("create old batches table: %v", err)
+	}
+
+	s, err := store.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatalf("migrate old schema: %v", err)
+	}
+	defer s.Close()
+
+	id := store.NewBatchID()
+	if _, err := raw.Exec(ctx,
+		`INSERT INTO batches (id, expected_chunks, status) VALUES ($1, 1, 'OPEN')`, id); err != nil {
+		t.Fatalf("insert old row: %v", err)
+	}
+	if _, err := s.SubmitChunk(ctx, id, 1, []byte("legacy")); err != nil {
+		t.Fatalf("old row legacy submit: %v", err)
+	}
+	if _, err := s.SealBatch(ctx, id); err != nil {
+		t.Fatalf("old row legacy seal: %v", err)
+	}
+	if _, err := s.RotateWriteToken(ctx, id, ""); !errors.Is(err, store.ErrNotProtected) {
+		t.Fatalf("old row rotate: want ErrNotProtected, got %v", err)
+	}
+}
+
+func TestUnprotectedBatchKeepsNoTokenProtocol(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newStore(ctx, t)
+	b := mustBatch(ctx, t, s, 1)
+
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("x")); err != nil {
+		t.Fatalf("legacy submit: %v", err)
+	}
+	if _, err := s.SealBatch(ctx, b.ID); err != nil {
+		t.Fatalf("legacy seal: %v", err)
+	}
+	if _, err := s.RotateWriteToken(ctx, b.ID, ""); !errors.Is(err, store.ErrNotProtected) {
+		t.Fatalf("rotate unprotected: want ErrNotProtected, got %v", err)
+	}
+}
+
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestConcurrentFirstBootMigrate points many brand-new stores at one fresh
@@ -516,12 +656,7 @@ func openRawPool(ctx context.Context, t *testing.T, schema string) *pgxpool.Pool
 	return pool
 }
 
-// lockBatchAndInsertChunk opens a raw transaction that locks the batch row
-// and inserts a chunk without committing - exactly what a concurrent
-// SubmitChunk on another instance looks like mid-flight. The returned xid
-// identifies the holder so waitForBlockedOnXid can prove a second transaction
-// is queued on the row lock.
-func lockBatchAndInsertChunk(ctx context.Context, t *testing.T, pool *pgxpool.Pool, batchID string, seq int, payload string) (pgx.Tx, uint64) {
+func lockBatch(ctx context.Context, t *testing.T, pool *pgxpool.Pool, batchID string) pgx.Tx {
 	t.Helper()
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -529,42 +664,57 @@ func lockBatchAndInsertChunk(ctx context.Context, t *testing.T, pool *pgxpool.Po
 	}
 	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
 	if _, err := tx.Exec(ctx,
-		`SELECT expected_chunks FROM batches WHERE id = $1 FOR UPDATE`, batchID); err != nil {
+		`SELECT write_token_digest FROM batches WHERE id = $1 FOR UPDATE`, batchID); err != nil {
 		t.Fatalf("holder lock batch: %v", err)
 	}
+	return tx
+}
+
+// lockBatchAndInsertChunk opens a raw transaction that locks the batch row
+// and inserts a chunk without committing - exactly what a concurrent
+// SubmitChunk on another instance looks like mid-flight.
+func lockBatchAndInsertChunk(ctx context.Context, t *testing.T, pool *pgxpool.Pool, batchID string, seq int, payload string) pgx.Tx {
+	t.Helper()
+	tx := lockBatch(ctx, t, pool, batchID)
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO chunks (batch_id, seq, payload) VALUES ($1, $2, $3)`,
 		batchID, seq, payload); err != nil {
 		t.Fatalf("holder insert chunk: %v", err)
 	}
-	var xid uint64
-	if err := tx.QueryRow(ctx, `SELECT txid_current()`).Scan(&xid); err != nil {
-		t.Fatalf("holder xid: %v", err)
-	}
-	return tx, xid
+	return tx
 }
 
-// waitForBlockedOnXid waits until some transaction is queued on the holder's
-// xid, proving the blocked statement - and with it the blocked transaction's
-// snapshot - started before the holder is allowed to commit.
-func waitForBlockedOnXid(ctx context.Context, t *testing.T, xid uint64) {
+// waitForRowLock waits until one statement is queued on the batch row lock,
+// proving the blocked transaction's snapshot was taken before the holder commits.
+func waitForRowLock(ctx context.Context, t *testing.T, schema string) {
+	t.Helper()
+	waitForBlockedCount(ctx, t, schema, 1)
+}
+
+func waitForBlockedCount(ctx context.Context, t *testing.T, schema string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		var n int
 		if err := basePool.QueryRow(ctx,
-			`SELECT count(*) FROM pg_locks
-			 WHERE locktype = 'transactionid' AND NOT granted
-			   AND transactionid::text = $1`,
-			fmt.Sprint(xid)).Scan(&n); err != nil {
+			`SELECT count(*)
+			 FROM pg_locks l
+			 JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE NOT l.granted
+			  AND (
+			        (l.locktype = 'tuple' AND l.relation = ($1 || '.batches')::regclass)
+			     OR (l.locktype = 'transactionid'
+			         AND a.query LIKE '%FROM batches%FOR UPDATE%')
+			  )`,
+			schema).Scan(&n); err != nil {
 			t.Fatalf("poll pg_locks: %v", err)
 		}
-		if n > 0 {
+		if n >= want {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("no transaction blocked on holder xid %d within 10s", xid)
+	t.Fatalf("fewer than %d transactions blocked on batches within 10s", want)
 }
 
 // TestSubmitObservesChunkCommittedDuringLockWait forces the interleaving in
@@ -594,7 +744,7 @@ func TestSubmitObservesChunkCommittedDuringLockWait(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			b := mustBatch(ctx, t, s, 1)
-			holder, xid := lockBatchAndInsertChunk(ctx, t, raw, b.ID, 1, "same-bytes")
+			holder := lockBatchAndInsertChunk(ctx, t, raw, b.ID, 1, "same-bytes")
 
 			type outcome struct {
 				res store.SubmitResult
@@ -606,7 +756,7 @@ func TestSubmitObservesChunkCommittedDuringLockWait(t *testing.T) {
 				done <- outcome{res, err}
 			}()
 			// The submit's snapshot is fixed before the holder commits.
-			waitForBlockedOnXid(ctx, t, xid)
+			waitForRowLock(ctx, t, schema)
 			if err := holder.Commit(ctx); err != nil {
 				t.Fatalf("commit holder: %v", err)
 			}
@@ -650,7 +800,7 @@ func TestSealObservesFinalChunkCommittedDuringLockWait(t *testing.T) {
 	raw := openRawPool(ctx, t, schema)
 
 	b := mustBatch(ctx, t, s, 1)
-	holder, xid := lockBatchAndInsertChunk(ctx, t, raw, b.ID, 1, "only")
+	holder := lockBatchAndInsertChunk(ctx, t, raw, b.ID, 1, "only")
 
 	type outcome struct {
 		snap *store.Snapshot
@@ -662,7 +812,7 @@ func TestSealObservesFinalChunkCommittedDuringLockWait(t *testing.T) {
 		done <- outcome{snap, err}
 	}()
 	// The seal's snapshot is fixed before the holder commits.
-	waitForBlockedOnXid(ctx, t, xid)
+	waitForRowLock(ctx, t, schema)
 	if err := holder.Commit(ctx); err != nil {
 		t.Fatalf("commit holder: %v", err)
 	}
@@ -673,5 +823,110 @@ func TestSealObservesFinalChunkCommittedDuringLockWait(t *testing.T) {
 	}
 	if got.snap.Status != store.StatusSealed || got.snap.Received != 1 || len(got.snap.Gaps) != 0 {
 		t.Fatalf("unexpected seal verdict: %+v", got.snap)
+	}
+}
+
+func TestRotationFirstInvalidatesQueuedOldTokenSubmit(t *testing.T) {
+	ctx := context.Background()
+	schema := newSchema(ctx, t)
+	s, err := store.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	other, err := store.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	raw := openRawPool(ctx, t, schema)
+
+	b, oldToken := mustProtectedBatch(ctx, t, s, 1)
+	holder := lockBatch(ctx, t, raw, b.ID)
+
+	type rotateOutcome struct {
+		token string
+		err   error
+	}
+	rotated := make(chan rotateOutcome, 1)
+	go func() {
+		token, err := s.RotateWriteToken(ctx, b.ID, oldToken)
+		rotated <- rotateOutcome{token, err}
+	}()
+	waitForRowLock(ctx, t, schema)
+
+	type submitOutcome struct{ err error }
+	submitted := make(chan submitOutcome, 1)
+	go func() {
+		_, err := other.SubmitChunk(ctx, b.ID, 1, []byte("old-token"), oldToken)
+		submitted <- submitOutcome{err}
+	}()
+	waitForBlockedCount(ctx, t, schema, 2)
+
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatalf("commit holder: %v", err)
+	}
+	rot := <-rotated
+	sub := <-submitted
+	if rot.err != nil {
+		t.Fatalf("queued rotation failed: %v", rot.err)
+	}
+	if !errors.Is(sub.err, store.ErrWriteCapability) {
+		t.Fatalf("queued old-token submit: want ErrWriteCapability, got %v", sub.err)
+	}
+	snap, err := s.Snapshot(ctx, b.ID)
+	if err != nil || snap.Received != 0 {
+		t.Fatalf("old-token submit wrote data: err=%v snap=%+v", err, snap)
+	}
+	if _, err := other.SubmitChunk(ctx, b.ID, 1, []byte("new-token"), rot.token); err != nil {
+		t.Fatalf("new token should submit after rotation: %v", err)
+	}
+}
+
+func TestOldTokenSubmitCanWinThenIsInvalidated(t *testing.T) {
+	ctx := context.Background()
+	schema := newSchema(ctx, t)
+	s, err := store.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	other, err := store.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	raw := openRawPool(ctx, t, schema)
+
+	b, oldToken := mustProtectedBatch(ctx, t, s, 1)
+	holder := lockBatch(ctx, t, raw, b.ID)
+
+	type submitOutcome struct {
+		res store.SubmitResult
+		err error
+	}
+	submitted := make(chan submitOutcome, 1)
+	go func() {
+		res, err := other.SubmitChunk(ctx, b.ID, 1, []byte("old-token"), oldToken)
+		submitted <- submitOutcome{res, err}
+	}()
+	waitForRowLock(ctx, t, schema)
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatalf("commit holder: %v", err)
+	}
+	sub := <-submitted
+	if sub.err != nil || !sub.res.Created {
+		t.Fatalf("queued old-token submit should succeed first: res=%+v err=%v", sub.res, sub.err)
+	}
+
+	newToken, err := s.RotateWriteToken(ctx, b.ID, oldToken)
+	if err != nil {
+		t.Fatalf("rotation after old-token submit: %v", err)
+	}
+	if _, err := other.SubmitChunk(ctx, b.ID, 1, []byte("old-token"), oldToken); !errors.Is(err, store.ErrWriteCapability) {
+		t.Fatalf("old token remained valid: %v", err)
+	}
+	if _, err := s.SealBatch(ctx, b.ID, newToken); err != nil {
+		t.Fatalf("seal with rotated token: %v", err)
 	}
 }

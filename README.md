@@ -55,9 +55,16 @@ docker compose down -v
 { "expectedChunks": 3 }
 ```
 
-`expectedChunks` 为整数，范围 **1–10000**（含端点）。
+也可以启用写保护：
 
-`201 Created`：
+```json
+{ "expectedChunks": 3, "protectWrites": true }
+```
+
+`expectedChunks` 为整数，范围 **1–10000**（含端点）。`protectWrites` 为可选布尔值；
+省略或 `false` 时完全保持旧协议，响应也没有额外字段。
+
+`201 Created`（未保护）：
 
 ```json
 {
@@ -67,6 +74,21 @@ docker compose down -v
   "createdAt": "2026-09-18T19:57:38.245878Z"
 }
 ```
+
+`protectWrites:true` 时，**仅此一次**额外返回服务生成的 `writeToken`。令牌是 256 位
+随机值的无填充 base64url 表示；数据库仅保存其 SHA-256 摘要：
+
+```json
+{
+  "batchId": "182a8a5485765bafb286a7a8e4ce7c69",
+  "expectedChunks": 3,
+  "status": "OPEN",
+  "createdAt": "2026-09-18T19:57:38.245878Z",
+  "writeToken": "49-5g8b7H..."
+}
+```
+
+状态查询不会返回令牌或摘要；调用方必须安全保存创建响应中的令牌。
 
 ### 2. 提交分片（允许乱序 / 重传 / 冲突）
 
@@ -78,6 +100,11 @@ docker compose down -v
 
 - `seq`：整数，**1 ≤ seq ≤ expectedChunks**
 - `payload`：字符串，UTF-8 编码后**至多 65536 字节**（按 UTF-8 字节判同，不是字符数）
+- 受保护批次必须携带 `X-Batch-Write-Token: <writeToken>`；未保护批次忽略该写能力，继续按旧协议工作。
+
+鉴权只在事务取得 `batches` 行锁后、检查序号/冲突/缺口/封存状态前执行，并使用恒定时间摘要比较。
+因此受保护批次上缺失或错误令牌统一为 **403 `WRITE_CAPABILITY_REQUIRED`**，不会泄露批次状态，
+也不会写入数据。
 
 | 情况 | 状态码 | 说明 |
 |---|---|---|
@@ -125,6 +152,9 @@ docker compose down -v
 
 `POST /api/v1/batches/{batchId}/seal`
 
+受保护批次同样必须提供有效的 `X-Batch-Write-Token`。令牌检查仍先在批次行锁内完成；
+错误令牌在计算缺口和封存状态前返回 **403 `WRITE_CAPABILITY_REQUIRED`**。
+
 - 序号全集齐备：**原子**进入 `SEALED`，返回 `200` 与终态
 - 仍有缺口：返回 **409 `INCOMPLETE`**（含升序 `gaps`），批次**保持 `OPEN`**
 - 对已 `SEALED` 批次重复封存：返回 **200** 与**既有封存结果**（`sealedAt` 不变）
@@ -143,6 +173,25 @@ docker compose down -v
 }
 ```
 
+### 5. 轮换写令牌
+
+`POST /api/v1/batches/{batchId}/write-token/rotate`
+
+请求头携带当前 `X-Batch-Write-Token`。服务在同一事务中先取得批次行锁、恒定时间校验旧摘要，
+然后生成新的 256 位令牌并原子更新 SHA-256 摘要。成功时以 `200` **一次**返回新令牌；轮换事务
+未提交前，旧令牌仍有效。提交后，所有携带旧令牌、当时正在行锁队列中等待的分片提交/封存都会
+得到 **403 `WRITE_CAPABILITY_REQUIRED`**。
+
+```json
+{
+  "batchId": "182a8a5485765bafb286a7a8e4ce7c69",
+  "writeToken": "m7Q...new"
+}
+```
+
+未保护批次轮换返回 **409 `BATCH_NOT_PROTECTED`**；受保护批次缺失或错误令牌返回
+**403 `WRITE_CAPABILITY_REQUIRED`**。
+
 ---
 
 ## 固定状态码表
@@ -160,6 +209,9 @@ docker compose down -v
 | 同序号不同内容 | 409 | `CHUNK_CONFLICT` |
 | 封存后变更内容 | 409 | `BATCH_SEALED` |
 | 缺片封存 | 409 | `INCOMPLETE`（携带 `gaps`，保持 OPEN） |
+| 受保护批次缺失/错误写令牌（提交、封存、轮换） | 403 | `WRITE_CAPABILITY_REQUIRED` |
+| 未保护批次轮换写令牌 | 409 | `BATCH_NOT_PROTECTED` |
+| 写令牌轮换成功 | 200 | — |
 | 分片首次写入 | 201 | — |
 | 相同内容重传 / 封存后相同重传 | 200 | — |
 | 齐备封存成功 / 重复封存 | 200 | — |
@@ -203,6 +255,13 @@ curl -s -X POST localhost:8080/api/v1/batches/$B/seal                           
 任何快照下都不可能出现 `status=SEALED` 而 `gaps` 非空。同序号两个不同内容并发时，
 一个事务先插入并提交，另一个读到已存字节并返回 `CHUNK_CONFLICT`，分片表始终只有一行。
 
+写令牌轮换也串行在同一把行锁上：
+
+- 轮换先进入队列并提交：使用旧令牌的分片提交随后才获得锁，看到新摘要并返回
+  `WRITE_CAPABILITY_REQUIRED`，不会插入任何分片；
+- 使用旧令牌的分片提交先进入队列：它可以按旧摘要成功，随后轮换原子替换摘要，旧令牌立即失效；
+- 两种顺序都在真实 PostgreSQL 和两个 HTTP 实例上通过行锁等待计数强制复现，而不是依赖随机调度。
+
 状态接口在一条 SQL 快照中同时计算 `received` 与 `gaps`，二者永远自洽。
 
 ## 重启一致性
@@ -233,10 +292,12 @@ go test -race -count=1 ./...
 关键测试：
 
 - `internal/store`：乱序、重传幂等、UTF-8 字节判同、冲突、封存不完整保持 OPEN、
-  封存/最后一片跨连接池竞争（30 轮）、双写冲突竞争（30 轮）、关闭全部连接后重开的重启一致性；
+  写令牌摘要/恒定时间校验/轮换、封存/最后一片跨连接池竞争（30 轮）、双写冲突竞争（30 轮）、
+  轮换与旧令牌提交的两种强制锁队列顺序、关闭全部连接后重开的重启一致性；
 - `internal/api`：两个独立连接池支撑的两个 HTTP 实例上交替写入/封存、全状态码矩阵、
-  跨实例封存竞争（20 轮）、关闭并重建两个实例后的终态一致性；
-- `cmd/verify`：Compose 内一次性验收程序，协议矩阵 + 25 轮跨实例竞争 + 重启两阶段。
+  受保护协议与旧协议兼容、跨实例封存竞争（20 轮）、跨实例令牌轮换锁顺序、
+  关闭并重建两个实例后的终态一致性；
+- `cmd/verify`：Compose 内一次性验收程序，协议矩阵 + 受保护写/轮换 + 25 轮跨实例竞争 + 重启两阶段。
 
 环境变量：
 

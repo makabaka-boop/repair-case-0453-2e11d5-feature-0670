@@ -15,11 +15,15 @@ import (
 	"batchseal/internal/api"
 	"batchseal/internal/store"
 	"batchseal/internal/testsupport"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const apiWriteTokenHeader = "X-Batch-Write-Token"
 
 // Two in-process HTTP servers backed by independent connection pools on the
 // same schema stand in for two API instances arbitrating via PostgreSQL.
-func newAPIs(t *testing.T) (string, string, func()) {
+func newAPIs(t *testing.T) (string, string, string, func()) {
 	t.Helper()
 	ctx := context.Background()
 	url := testsupport.RequireURL(t)
@@ -42,7 +46,7 @@ func newAPIs(t *testing.T) (string, string, func()) {
 		s2.Close()
 		testsupport.DropSchema(ctx, schema)
 	}
-	return srv1.URL, srv2.URL, cleanup
+	return srv1.URL, srv2.URL, schema, cleanup
 }
 
 type client struct {
@@ -53,7 +57,7 @@ func newClient() *client {
 	return &client{http: &http.Client{Timeout: 15 * time.Second}}
 }
 
-func (c *client) do(t *testing.T, method, url, raw string, body any) (int, map[string]any) {
+func (c *client) do(t *testing.T, method, url, raw string, body any, headers ...map[string]string) (int, map[string]any) {
 	t.Helper()
 	var rdr io.Reader
 	if raw != "" {
@@ -72,6 +76,11 @@ func (c *client) do(t *testing.T, method, url, raw string, body any) (int, map[s
 	if body != nil || raw != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	for _, h := range headers {
+		for k, v := range h {
+			req.Header.Set(k, v)
+		}
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, url, err)
@@ -87,20 +96,20 @@ func (c *client) do(t *testing.T, method, url, raw string, body any) (int, map[s
 	return resp.StatusCode, parsed
 }
 
-func (c *client) post(t *testing.T, url string, body any) (int, map[string]any) {
-	return c.do(t, http.MethodPost, url, "", body)
+func (c *client) post(t *testing.T, url string, body any, headers ...map[string]string) (int, map[string]any) {
+	return c.do(t, http.MethodPost, url, "", body, headers...)
 }
 
-func (c *client) postRaw(t *testing.T, url, raw string) (int, map[string]any) {
-	return c.do(t, http.MethodPost, url, raw, nil)
+func (c *client) postRaw(t *testing.T, url, raw string, headers ...map[string]string) (int, map[string]any) {
+	return c.do(t, http.MethodPost, url, raw, nil, headers...)
 }
 
-func (c *client) get(t *testing.T, url string) (int, map[string]any) {
-	return c.do(t, http.MethodGet, url, "", nil)
+func (c *client) get(t *testing.T, url string, headers ...map[string]string) (int, map[string]any) {
+	return c.do(t, http.MethodGet, url, "", nil, headers...)
 }
 
 func TestHTTPLifecycleAcrossTwoInstances(t *testing.T) {
-	u1, u2, cleanup := newAPIs(t)
+	u1, u2, _, cleanup := newAPIs(t)
 	defer cleanup()
 	c := newClient()
 
@@ -174,7 +183,7 @@ func TestHTTPLifecycleAcrossTwoInstances(t *testing.T) {
 }
 
 func TestHTTPIncompleteSealReportsGaps(t *testing.T) {
-	u1, _, cleanup := newAPIs(t)
+	u1, _, _, cleanup := newAPIs(t)
 	defer cleanup()
 	c := newClient()
 
@@ -204,7 +213,7 @@ func TestHTTPIncompleteSealReportsGaps(t *testing.T) {
 }
 
 func TestHTTPValidationCodes(t *testing.T) {
-	u1, u2, cleanup := newAPIs(t)
+	u1, u2, _, cleanup := newAPIs(t)
 	defer cleanup()
 	c := newClient()
 
@@ -271,11 +280,160 @@ func TestHTTPValidationCodes(t *testing.T) {
 	}
 }
 
+func TestHTTPProtectedWritesAndRotation(t *testing.T) {
+	u1, u2, _, cleanup := newAPIs(t)
+	defer cleanup()
+	c := newClient()
+	tokenHeader := func(token string) map[string]string {
+		return map[string]string{apiWriteTokenHeader: token}
+	}
+
+	code, body := c.post(t, u1+"/api/v1/batches", map[string]int{"expectedChunks": 2})
+	if code != 201 {
+		t.Fatalf("omitted protectWrites: %d %v", code, body)
+	}
+	if _, exists := body["writeToken"]; exists {
+		t.Fatalf("unprotected response exposed writeToken: %v", body)
+	}
+	unprotectedID := body["batchId"].(string)
+	code, body = c.post(t, u1+"/api/v1/batches",
+		map[string]any{"expectedChunks": 2, "protectWrites": false})
+	if code != 201 {
+		t.Fatalf("explicit false protectWrites: %d %v", code, body)
+	}
+	if _, exists := body["writeToken"]; exists {
+		t.Fatalf("protectWrites=false response exposed writeToken: %v", body)
+	}
+	code, body = c.post(t, u2+"/api/v1/batches/"+unprotectedID+"/write-token/rotate", nil)
+	if code != 409 || body["error"] != "BATCH_NOT_PROTECTED" {
+		t.Fatalf("unprotected rotate: code=%d body=%v", code, body)
+	}
+
+	code, body = c.post(t, u1+"/api/v1/batches",
+		map[string]any{"expectedChunks": 2, "protectWrites": true})
+	if code != 201 {
+		t.Fatalf("create protected: code=%d body=%v", code, body)
+	}
+	protectedID := body["batchId"].(string)
+	token, _ := body["writeToken"].(string)
+	if len(token) != 43 {
+		t.Fatalf("writeToken has wrong length: %q", token)
+	}
+	code, snap := c.get(t, u2+"/api/v1/batches/"+protectedID)
+	if code != 200 {
+		t.Fatalf("status query: %d", code)
+	}
+	if _, exists := snap["writeToken"]; exists {
+		t.Fatalf("status exposed writeToken: %v", snap)
+	}
+	if _, exists := snap["writeTokenDigest"]; exists {
+		t.Fatalf("status exposed digest: %v", snap)
+	}
+
+	for _, header := range []map[string]string{nil, tokenHeader("wrong")} {
+		code, body = c.post(t, u1+"/api/v1/batches/"+protectedID+"/chunks",
+			map[string]any{"seq": 0, "payload": "bad-seq"}, header)
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			t.Fatalf("bad token must precede seq check: code=%d body=%v", code, body)
+		}
+		code, body = c.post(t, u2+"/api/v1/batches/"+protectedID+"/seal", nil, header)
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			t.Fatalf("bad token seal: code=%d body=%v", code, body)
+		}
+		code, body = c.post(t, u1+"/api/v1/batches/"+protectedID+"/write-token/rotate", nil, header)
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			t.Fatalf("bad token rotate: code=%d body=%v", code, body)
+		}
+	}
+
+	code, _ = c.post(t, u2+"/api/v1/batches/"+protectedID+"/chunks",
+		map[string]any{"seq": 1, "payload": "one"}, tokenHeader(token))
+	if code != 201 {
+		t.Fatalf("valid protected submit: %d", code)
+	}
+	for _, header := range []map[string]string{nil, tokenHeader("wrong")} {
+		code, body = c.post(t, u1+"/api/v1/batches/"+protectedID+"/chunks",
+			map[string]any{"seq": 2, "payload": "blocked"}, header)
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			t.Fatalf("gap bad token chunk: code=%d body=%v", code, body)
+		}
+		code, body = c.post(t, u2+"/api/v1/batches/"+protectedID+"/seal", nil, header)
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			t.Fatalf("gap bad token seal: code=%d body=%v", code, body)
+		}
+	}
+	code, body = c.post(t, u1+"/api/v1/batches/"+protectedID+"/write-token/rotate",
+		nil, tokenHeader(token))
+	if code != 200 {
+		t.Fatalf("rotate valid token: code=%d body=%v", code, body)
+	}
+	newToken := body["writeToken"].(string)
+	if newToken == token {
+		t.Fatal("rotation returned the old token")
+	}
+	code, _ = c.post(t, u2+"/api/v1/batches/"+protectedID+"/chunks",
+		map[string]any{"seq": 2, "payload": "two"}, tokenHeader(token))
+	if code != 403 {
+		t.Fatalf("old token accepted after rotation: %d", code)
+	}
+	code, _ = c.post(t, u1+"/api/v1/batches/"+protectedID+"/chunks",
+		map[string]any{"seq": 2, "payload": "two"}, tokenHeader(newToken))
+	if code != 201 {
+		t.Fatalf("new token submit: %d", code)
+	}
+	code, body = c.post(t, u2+"/api/v1/batches/"+protectedID+"/seal", nil, tokenHeader("wrong"))
+	if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+		t.Fatalf("wrong token before sealing verdict: code=%d body=%v", code, body)
+	}
+	code, body = c.post(t, u1+"/api/v1/batches/"+protectedID+"/seal", nil, tokenHeader(newToken))
+	if code != 200 || body["status"] != "SEALED" {
+		t.Fatalf("valid seal: code=%d body=%v", code, body)
+	}
+
+	// Sealed state must still authenticate before revealing BATCH_SEALED or
+	// idempotent sealing results.
+	for _, tok := range []string{"", "wrong", token} {
+		code, body = c.post(t, u2+"/api/v1/batches/"+protectedID+"/chunks",
+			map[string]any{"seq": 1, "payload": "changed"}, tokenHeader(tok))
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			t.Fatalf("sealed wrong token chunk: code=%d body=%v", code, body)
+		}
+		code, body = c.post(t, u1+"/api/v1/batches/"+protectedID+"/seal", nil, tokenHeader(tok))
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			t.Fatalf("sealed wrong token seal: code=%d body=%v", code, body)
+		}
+		code, body = c.post(t, u2+"/api/v1/batches/"+protectedID+"/write-token/rotate",
+			nil, tokenHeader(tok))
+		if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+			t.Fatalf("sealed wrong token rotate: code=%d body=%v", code, body)
+		}
+	}
+	code, _ = c.post(t, u1+"/api/v1/batches/"+protectedID+"/chunks",
+		map[string]any{"seq": 1, "payload": "one"}, tokenHeader(newToken))
+	if code != 200 {
+		t.Fatalf("valid identical sealed retransmission: %d", code)
+	}
+	code, body = c.post(t, u2+"/api/v1/batches/"+protectedID+"/seal", nil, tokenHeader(newToken))
+	if code != 200 || body["status"] != "SEALED" {
+		t.Fatalf("valid repeated sealed response: code=%d body=%v", code, body)
+	}
+	code, body = c.post(t, u1+"/api/v1/batches/"+protectedID+"/chunks",
+		map[string]any{"seq": 1, "payload": "changed"}, tokenHeader(newToken))
+	if code != 409 || body["error"] != "BATCH_SEALED" {
+		t.Fatalf("authenticated sealed change: code=%d body=%v", code, body)
+	}
+	code, body = c.post(t, u2+"/api/v1/batches/"+protectedID+"/write-token/rotate",
+		nil, tokenHeader(newToken))
+	if code != 200 {
+		t.Fatalf("rotation after seal: code=%d body=%v", code, body)
+	}
+}
+
 // TestHTTPCrossInstanceSealRace drives the final chunk through one instance
 // and the seal through the other concurrently. A SEALED batch must never be
 // missing a chunk.
 func TestHTTPCrossInstanceSealRace(t *testing.T) {
-	u1, u2, cleanup := newAPIs(t)
+	u1, u2, _, cleanup := newAPIs(t)
 	defer cleanup()
 	c := newClient()
 
@@ -301,6 +459,158 @@ func TestHTTPCrossInstanceSealRace(t *testing.T) {
 		if snap["status"] == "SEALED" && int(snap["received"].(float64)) != 1 {
 			t.Fatalf("SEALED with missing chunk: %v", snap)
 		}
+	}
+}
+
+type httpResult struct {
+	code int
+	body map[string]any
+}
+
+func waitForHTTPBlocked(t *testing.T, pool *pgxpool.Pool, ctx context.Context, schema string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		err := pool.QueryRow(ctx,
+			`SELECT count(*)
+			 FROM pg_locks l
+			 JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE NOT l.granted
+			  AND (
+			        (l.locktype = 'tuple' AND l.relation = ($1 || '.batches')::regclass)
+			     OR (l.locktype = 'transactionid'
+			         AND a.query LIKE '%FROM batches%FOR UPDATE%')
+			  )`, schema).Scan(&n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n >= count {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("did not observe %d queued requests on batches", count)
+}
+
+func rawBatchLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context, batchID string) func() {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT write_token_digest FROM batches WHERE id = $1 FOR UPDATE`, batchID); err != nil {
+		t.Fatal(err)
+	}
+	return func() { _ = tx.Commit(ctx) }
+}
+
+// TestHTTPRotationFirstQueuesThenRejectsOldSubmit forces two HTTP instances
+// through the row-lock ordering: rotation is first in the queue, an old-token
+// submit is second. When the holder releases the lock, rotation commits first
+// and the queued submit must receive 403 without writing.
+func TestHTTPRotationFirstQueuesThenRejectsOldSubmit(t *testing.T) {
+	u1, u2, schema, cleanup := newAPIs(t)
+	defer cleanup()
+	ctx := context.Background()
+	c := newClient()
+	pool, err := pgxpool.New(ctx, testsupport.SchemaURL(testsupport.RequireURL(t), schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	_, body := c.post(t, u1+"/api/v1/batches",
+		map[string]any{"expectedChunks": 1, "protectWrites": true})
+	batchID := body["batchId"].(string)
+	oldToken := body["writeToken"].(string)
+	release := rawBatchLock(t, pool, ctx, batchID)
+
+	rotated := make(chan httpResult, 1)
+	submitted := make(chan httpResult, 1)
+	go func() {
+		code, body := c.post(t, u1+"/api/v1/batches/"+batchID+"/write-token/rotate",
+			nil, map[string]string{apiWriteTokenHeader: oldToken})
+		rotated <- httpResult{code, body}
+	}()
+	waitForHTTPBlocked(t, pool, ctx, schema, 1)
+	go func() {
+		code, body := c.post(t, u2+"/api/v1/batches/"+batchID+"/chunks",
+			map[string]any{"seq": 1, "payload": "old"},
+			map[string]string{apiWriteTokenHeader: oldToken})
+		submitted <- httpResult{code, body}
+	}()
+	waitForHTTPBlocked(t, pool, ctx, schema, 2)
+
+	release()
+	rot := <-rotated
+	sub := <-submitted
+	if rot.code != 200 {
+		t.Fatalf("rotation: code=%d body=%v", rot.code, rot.body)
+	}
+	if sub.code != 403 || sub.body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+		t.Fatalf("queued old submit: code=%d body=%v", sub.code, sub.body)
+	}
+	code, snap := c.get(t, u1+"/api/v1/batches/"+batchID)
+	if code != 200 || int(snap["received"].(float64)) != 0 {
+		t.Fatalf("queued rejected submit changed data: code=%d body=%v", code, snap)
+	}
+	code, _ = c.post(t, u2+"/api/v1/batches/"+batchID+"/chunks",
+		map[string]any{"seq": 1, "payload": "new"},
+		map[string]string{apiWriteTokenHeader: rot.body["writeToken"].(string)})
+	if code != 201 {
+		t.Fatalf("rotated token submit: %d", code)
+	}
+}
+
+func TestHTTPOldSubmitQueuedFirstSucceedsThenRotationInvalidatesIt(t *testing.T) {
+	u1, u2, schema, cleanup := newAPIs(t)
+	defer cleanup()
+	ctx := context.Background()
+	c := newClient()
+	pool, err := pgxpool.New(ctx, testsupport.SchemaURL(testsupport.RequireURL(t), schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	_, body := c.post(t, u1+"/api/v1/batches",
+		map[string]any{"expectedChunks": 1, "protectWrites": true})
+	batchID := body["batchId"].(string)
+	oldToken := body["writeToken"].(string)
+	release := rawBatchLock(t, pool, ctx, batchID)
+
+	done := make(chan httpResult, 1)
+	go func() {
+		code, body := c.post(t, u2+"/api/v1/batches/"+batchID+"/chunks",
+			map[string]any{"seq": 1, "payload": "old"},
+			map[string]string{apiWriteTokenHeader: oldToken})
+		done <- httpResult{code, body}
+	}()
+	waitForHTTPBlocked(t, pool, ctx, schema, 1)
+	release()
+	sub := <-done
+	if sub.code != 201 || sub.body["duplicate"] != false {
+		t.Fatalf("queued old-token submit should succeed first: code=%d body=%v", sub.code, sub.body)
+	}
+
+	code, body := c.post(t, u1+"/api/v1/batches/"+batchID+"/write-token/rotate",
+		nil, map[string]string{apiWriteTokenHeader: oldToken})
+	if code != 200 {
+		t.Fatalf("rotation after successful old submit: code=%d body=%v", code, body)
+	}
+	newToken := body["writeToken"].(string)
+	code, body = c.post(t, u2+"/api/v1/batches/"+batchID+"/chunks",
+		map[string]any{"seq": 1, "payload": "old"},
+		map[string]string{apiWriteTokenHeader: oldToken})
+	if code != 403 || body["error"] != "WRITE_CAPABILITY_REQUIRED" {
+		t.Fatalf("old token remained valid after rotation: code=%d body=%v", code, body)
+	}
+	code, _ = c.post(t, u1+"/api/v1/batches/"+batchID+"/seal",
+		nil, map[string]string{apiWriteTokenHeader: newToken})
+	if code != 200 {
+		t.Fatalf("seal with rotated token: %d", code)
 	}
 }
 
